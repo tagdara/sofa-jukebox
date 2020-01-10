@@ -2,3 +2,6 @@ config.json
 log
 gp
 .cache*
+user_playlist.json
+backup_playlist.json
+
