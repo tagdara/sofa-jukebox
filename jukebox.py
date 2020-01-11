@@ -17,6 +17,7 @@ import socket
 import sys
 import datetime
 from os.path import isfile, isdir, join
+import subprocess
 
 import logging
 from logging.handlers import RotatingFileHandler
@@ -34,6 +35,7 @@ class web_server():
     def initialize(self):
             
         try:
+            self.subscribers= set()
             self.info = {}
             self.token = None
             self.spotify = Spotify()
@@ -44,6 +46,9 @@ class web_server():
             })
 
             self.cors.add(self.serverApp.router.add_get('/', self.root_handler))
+            self.cors.add(self.serverApp.router.add_static('/client', path=self.config['client_build_directory'], append_version=True))
+            self.cors.add(self.serverApp.router.add_get('/sse', self.sse_handler))
+            
             self.cors.add(self.serverApp.router.add_get('/playlist/{playlist}', self.playlist_handler))
             self.cors.add(self.serverApp.router.add_get('/playlists', self.playlists_handler))
             self.cors.add(self.serverApp.router.add_get('/auth', self.auth_handler))
@@ -58,7 +63,11 @@ class web_server():
             self.cors.add(self.serverApp.router.add_get('/setbackup/{playlist}', self.setbackup_handler))
             self.cors.add(self.serverApp.router.add_get('/user', self.user_handler))
             self.cors.add(self.serverApp.router.add_get('/queue', self.queue_handler))
+            self.cors.add(self.serverApp.router.add_get('/search/{search}', self.search_handler))
+            self.cors.add(self.serverApp.router.add_get('/add/{id}', self.add_handler))
             self.cors.add(self.serverApp.router.add_get('/nowplaying', self.nowplaying_handler))
+            self.cors.add(self.serverApp.router.add_get('/del/{id}', self.del_handler))
+            self.cors.add(self.serverApp.router.add_get('/spotifyd/{action}', self.spotifyd_handler))
             self.runner = aiohttp.web.AppRunner(self.serverApp)
             self.loop.run_until_complete(self.runner.setup())
 
@@ -68,14 +77,14 @@ class web_server():
             self.ssl_context.load_cert_chain(str(ssl_cert), str(ssl_key))
 
             self.site = web.TCPSite(self.runner, self.config['hostname'], self.config['port'], ssl_context=self.ssl_context)
-            self.log.info('Starting editor webserver at https://%s:%s' % (self.config['hostname'], self.config['port']))
+            self.log.info('.. Starting jukebox webserver at https://%s:%s' % (self.config['hostname'], self.config['port']))
             self.loop.run_until_complete(self.site.start())
             return True
         except socket.gaierror:
-            self.log.error('Error - DNS or network down during intialize.', exc_info=True)
+            self.log.error('!! Error - DNS or network down during intialize.', exc_info=True)
             return False
         except:
-            self.log.error('Error starting REST server', exc_info=True)
+            self.log.error('!! Error starting REST server', exc_info=True)
             return False
 
     def authenticate(func):
@@ -107,6 +116,14 @@ class web_server():
 
     async def root_handler(self, request):
         try:
+            self.log.info('Serving react app to %s' % request.remote)
+            #return web.FileResponse(os.path.join(self.config['client_static_directory'],'index.html'))
+            return web.FileResponse(os.path.join(self.config['client_build_directory'],'index.html'))
+        except:
+            self.log.error('Error serving root page', exc_info=True)
+
+    async def old_root_handler(self, request):
+        try:
             if self.goback:
                 q=self.goback
                 self.goback=None
@@ -115,6 +132,22 @@ class web_server():
         except requests.exceptions.HTTPError:
             self.goback=request.raw_path
             raise web.HTTPTemporaryRedirect('/auth')
+
+    async def sse_handler(self, request):
+        async with sse_response(request) as response:
+            remoteip=request.remote
+            queue = asyncio.Queue()
+            self.log.info('.. new remote user from %s' % remoteip)
+            self.subscribers.add(queue)
+            try:
+                while not response.task.done():
+                    payload = await queue.get()
+                    await response.send(payload)
+                    queue.task_done()
+            finally:
+                self.subscribers.remove(queue)
+                self.log.info('.. user disconnected from %s' % remoteip)
+        return response
 
     async def user_handler(self, request):
         try:
@@ -149,7 +182,7 @@ class web_server():
         try:
             name=request.match_info['device']
             self.log.info('Trying to set device to %s' % name)
-            result=self.app.spotify.set_playback_device(name)
+            result=await self.app.spotify.set_playback_device(name)
             return web.json_response(result)
         except requests.exceptions.HTTPError:
             self.goback=request.raw_path
@@ -178,7 +211,7 @@ class web_server():
     async def setbackup_handler(self, request):
         
         try:
-            playlist=self.app.spotify.set_backup_playlist(request.match_info['playlist'])
+            playlist=await self.app.spotify.set_backup_playlist(request.match_info['playlist'])
             return web.json_response(playlist)
         except requests.exceptions.HTTPError:
             self.goback=request.raw_path
@@ -198,8 +231,7 @@ class web_server():
         vals=self.get_query_string_variables(request.query_string)
         if 'code' in vals:
             code=vals['code']
-            self.app.spotify.set_code(code)
-            self.app.spotify.set_token(code)
+            result=await self.app.spotify.set_token(code)
             return web.json_response({'authenticated':True})
 
         return web.json_response({'authenticated':False})
@@ -215,8 +247,8 @@ class web_server():
     async def pause_handler(self, request):
         
         try:
-            result=self.app.spotify.pause()
-            return web.json_response(self.app.spotify.now_playing())
+            result=await self.app.spotify.pause()
+            return web.json_response(await self.app.spotify.now_playing())
         except:
             self.log.info('error getting favorites', exc_info=True)
             return web.json_response([])
@@ -257,26 +289,58 @@ class web_server():
 
     async def play_handler(self, request):
         try:
-            result=self.app.spotify.play()
-            return web.json_response(self.app.spotify.now_playing())
+            result=await self.app.spotify.play()
+            return web.json_response(await self.app.spotify.now_playing())
         except:
             self.log.error('Error sending play command',exc_info=True)
             return web.Response(text='error')
 
     async def next_handler(self, request):
         try:
-            result=self.app.spotify.next_track()
-            return web.json_response(self.app.spotify.now_playing())
+            result=await self.app.spotify.next_track()
+            return web.json_response(await self.app.spotify.now_playing())
         except:
             self.log.error('Error sending play command',exc_info=True)
             return web.Response(text='error')
 
+    async def search_handler(self, request):
+        try:
+            search=request.match_info['search']
+            return web.json_response(await self.app.spotify.search(search))
+        except:
+            self.log.info('error getting favorites', exc_info=True)
+            return web.json_response([])
+
+    async def add_handler(self, request):
+        try:
+            song_id=request.match_info['id']
+            return web.json_response(await self.app.spotify.add_track(song_id))
+        except:
+            self.log.info('error getting favorites', exc_info=True)
+            return web.json_response([])
+
+    async def del_handler(self, request):
+        try:
+            song_id=request.match_info['id']
+            return web.json_response(await self.app.spotify.del_track(song_id))
+        except:
+            self.log.info('error removing track', exc_info=True)
+            return web.json_response([])
+
+    async def spotifyd_handler(self, request):
+        try:
+            action=request.match_info['action']
+            return web.json_response(await self.app.spotify.spotifyd_control(action))
+        except:
+            self.log.info('error removing track', exc_info=True)
+            return web.json_response([])
+
 
     async def queue_handler(self, request):
-        return web.json_response(self.app.spotify.get_queue())
+        return web.json_response(await self.app.spotify.get_queue())
 
     async def nowplaying_handler(self, request):
-        return web.json_response(self.app.spotify.now_playing())
+        return web.json_response(await self.app.spotify.now_playing())
 
 
 class AuthorizationNeeded(Exception):
@@ -299,6 +363,8 @@ class sofa_spotify_controller(object):
         self.spotify = Spotify()
         self.user_info={}
         self.player=None
+        self.device=None
+        self.user_pause=False
         
         self.backup_playlist=self.loadJSON('backup_playlist')
         self.user_playlist=self.loadJSON('user_playlist')
@@ -310,15 +376,20 @@ class sofa_spotify_controller(object):
                 print(resp.status)
                 return await resp.text()
 
+    async def set_token(self, code):
+        try:
+            self.log.info('Setting token from code: %s...' % code[:10])
+            self.code = code
+            self.token = self.credentials.request_user_token(code)
+            self.player = Spotify(token=self.token)
+            if self.player:
+                if not self.device:
+                    await self.set_playback_device(self.config['default_device'])
+            await self.update_list('update')
+            await self.update_nowplaying()
+        except:
+            self.log.error('Error setting playback device to %s' % name, exc_info=True)
 
-    def set_code(self, code):
-        self.log.info('Setting code: %s...' % code[:10])
-        self.code = code
-
-    def set_token(self, code):
-        self.log.info('Setting token from code: %s...' % code[:10])
-        self.token = self.credentials.request_user_token(code)
-        self.player = Spotify(token=self.token)
 
     def authenticated(func):
         def wrapper(self):
@@ -341,40 +412,41 @@ class sofa_spotify_controller(object):
         self.auth_url = self.credentials.user_authorisation_url(scope=every)
         return self.auth_url
         
-    def set_playback_device(self, name):
+    async def set_playback_device(self, name):
         # This allows you to select a playback device by name
         try:
             devs=self.player.playback_devices()
             for dev in devs:
                 if dev.name==name:
                     self.player.playback_transfer(dev.id)
+                    self.device=dev.id
                     return True
             return False
         except:
             self.log.error('Error setting playback device to %s' % name, exc_info=True)
 
     @authenticated
-    def get_playback_devices(self):
+    async def get_playback_devices(self):
         try:
             return json.loads(str(self.player.playback_devices()))
         except:
             self.log.error('Error getting spotify connect devices', exc_info=True)
             return []
             
-    def get_user_playlist(self, name):
+    async def get_user_playlist(self, name):
         
         try:
             playlists = self.player.followed_playlists()
             for playlist in playlists.items:
                 if playlist.name==name:
-                    print('found playlist: %s' % playlist.name)
+                    self.log.info('found playlist: %s' % playlist.name)
                     return {"name":playlist.name, "id":playlist.id}
             return {}
         except:
             self.log.error('Error searching spotify', exc_info=True)
             return {}
 
-    def get_user_playlists(self):
+    async def get_user_playlists(self):
         
         try:
             display_list=[]
@@ -387,7 +459,7 @@ class sofa_spotify_controller(object):
             return []
 
 
-    def get_playlist_tracks(self, id):
+    async def get_playlist_tracks(self, id):
         
         try:
             display_list=[]
@@ -400,27 +472,61 @@ class sofa_spotify_controller(object):
             return []
 
     
-    def search(self, search, types=('track',), limit=10):
+    async def search(self, search, types=('track',), limit=20):
         try:
             display_list=[]
             result = self.player.search(search, types=types, limit=limit)      
             for track in result[0].items:
-                #print(track.__dict__)
-                artists=""
-                for artist in track.artists:
-                    artists+=artist.name
-                display_list.append({"name": track.name, "artists": artists, "album": track.album.name, "url":track.href})
-                self.prevurl=track.preview_url
-            display_list=json.loads(json.dumps(display_list))
-
-            #self.player.play(self.prevurl)
+                display_list.append({"id": track.id, "name": track.name, "art":track.album.images[0].url, "artist": track.artists[0].name, "album": track.album.name, "url":track.href})
             return display_list
 
         except:
             self.log.error('Error searching spotify', exc_info=True)
             return []
 
-    def get_queue(self):
+    async def add_track(self, song_id):
+        try:
+            self.log.info('Track ID: %s' % song_id)
+            track = self.player.track(song_id)
+            self.log.info('Adding track: %s' % {"id": track.id, "name": track.name, "art":track.album.images[0].url, "artist": track.artists[0].name, "album": track.album.name, "url":track.href})
+            pltrack={"id": track.id, "name": track.name, "art":track.album.images[0].url, "artist": track.artists[0].name, "album": track.album.name, "url":track.href}
+            self.user_playlist.append(pltrack)
+            self.saveJSON('user_playlist', self.user_playlist)
+            await self.update_list('update')
+        except:
+            self.log.error('Error adding song %s' % song_id, exc_info=True)
+            return []
+
+    async def del_track(self, song_id):
+        try:
+            remove_count=0
+            newlist=[]
+            for song in self.user_playlist:
+                if song['id']!=song_id:
+                    self.log.info('Adding non-delete: %s vs %s' % (song['id'],song_id))
+                    newlist.append(song)
+                else:
+                    remove_count+=1
+            self.user_playlist=newlist
+            self.saveJSON('user_playlist', self.user_playlist)
+            
+            newlist=[]
+            for song in self.backup_playlist:
+                if song['id']!=song_id:
+                    newlist.append(song)
+                else:
+                    remove_count+=1
+            self.backup_playlist=newlist
+            self.saveJSON('backup_playlist', self.backup_playlist)   
+            await self.update_list('update')
+            return {"removed":remove_count}
+        except:
+            self.log.error('Error adding song %s' % song_id, exc_info=True)
+            return []
+
+
+
+    async def get_queue(self):
         try:
             fullqueue=self.user_playlist+self.backup_playlist
             return fullqueue
@@ -428,7 +534,45 @@ class sofa_spotify_controller(object):
             self.log.error('Error getting full queue', exc_info=True)
             return []
             
-    def now_playing(self):
+    async def update_nowplaying(self):
+        try:
+            nowplaying=await self.now_playing()
+            await self.update_subscribers({'nowplaying':nowplaying})
+            
+        except:
+            self.log.error('Error updating now playing subscribers', exc_info=True)
+            return []
+
+    async def update_list(self, action):
+        try:
+            nowplaying=await self.now_playing()
+            await self.update_subscribers({'playlist':action})
+            
+        except:
+            self.log.error('Error updating now playing subscribers', exc_info=True)
+            return []
+
+
+    async def update_subscribers(self, data):
+        try:
+            payload = json.dumps(data)
+            for q in self.app.server.subscribers:
+                await q.put(payload)      
+        except:
+            self.log.error('Error updating now playing subscribers', exc_info=True)
+            return []
+
+    async def spotifyd_control(self, action="restart"):
+        
+        try:
+            stdoutdata = subprocess.getoutput("systemctl %s spotifyd" % action)
+            return stdoutdata
+        except:
+            self.log.error('!! Error restarting adapter', exc_info=True)
+
+
+                
+    async def now_playing(self):
         try:
             npdata=self.player.playback_currently_playing()
             if npdata:
@@ -446,29 +590,36 @@ class sofa_spotify_controller(object):
             self.log.error('Error getting now playing', exc_info=True)
             return {}
             
-    def pause(self):     
+    async def pause(self):     
         try:
             self.log.info('sending pause')
             self.player.playback_pause()
+            await self.update_nowplaying()
+            await self.start_status()
+            self.user_pause=True
             return True
         except:
             self.log.error('Error pausing', exc_info=True)
             return False
 
-    def play(self):     
+    async def play(self):     
         try:
             self.log.info('sending play')
             self.player.playback_resume()
+            self.active=True
+            await self.update_nowplaying()
+            await self.start_status()
+            self.user_pause=False
             return True
         except:
             self.log.error('Error playing', exc_info=True)
             return False
 
 
-    def set_backup_playlist(self, name):
+    async def set_backup_playlist(self, name):
         try:
-            playlist=self.get_user_playlist(name)
-            track_list=self.app.spotify.get_playlist_tracks(playlist['id'])
+            playlist=await self.get_user_playlist(name)
+            track_list=await self.app.spotify.get_playlist_tracks(playlist['id'])
             self.backup_playlist=list(track_list)
             self.saveJSON('backup_playlist', self.backup_playlist)
             #self.log.info('Backup playlist is now: %s' % self.backup_playlist)
@@ -477,20 +628,20 @@ class sofa_spotify_controller(object):
             self.log.error('Error setting backup playlist', exc_info=True)
             return []
 
-    def get_next_track(self):
+    async def get_next_track(self):
         try:
             next_track={}
-            next_track=self.pop_user_track()
+            next_track=await self.pop_user_track()
             self.log.info('Getting user track: %s' % next_track)
             if not next_track:
-                next_track=self.pop_backup_track()
+                next_track=await self.pop_backup_track()
                 self.log.info('Getting backup track: %s' % next_track)
             return next_track
         except:
             self.log.error('Error getting next track from queues')
             return {}
 
-    def pop_user_track(self):
+    async def pop_user_track(self):
         try:
             if self.user_playlist:
                 next_track=self.user_playlist.pop(0)
@@ -502,7 +653,7 @@ class sofa_spotify_controller(object):
             self.log.error('Error getting track from backup playlist')
             return {}
             
-    def pop_backup_track(self):
+    async def pop_backup_track(self):
         try:
             if self.backup_playlist:
                 next_track=self.backup_playlist.pop(0)
@@ -511,23 +662,25 @@ class sofa_spotify_controller(object):
             else:
                 return {}
         except:
-            self.log.error('Error getting track from backup playlist')
+            self.log.error('Error getting track from backup playlist', exc_info=True)
             return {}
 
-    def next_track(self):
+    async def next_track(self):
         try:
-            next_track=self.get_next_track()
+            next_track=await self.get_next_track()
             if next_track:
                 self.active=True
-                self.play_id(next_track['id'])
+                await self.play_id(next_track['id'])
+                await self.update_nowplaying()
+                await self.update_list('pop')
             else:
                 self.log.info('No more tracks to play')
-                self.active=False
+                #self.active=False
         except:
             self.log.error('Error trying to play', exc_info=True)
-            self.active=False
+            #self.active=False
 
-    def play_id(self, id):
+    async def play_id(self, id):
         try:
             self.player.playback_start_tracks([id])
             self.active=True
@@ -567,7 +720,9 @@ class sofa_spotify_controller(object):
 
 
     async def start_status(self):
-        self.task = loop.create_task(periodic())
+        self.log.info('Starting status loop')
+
+        self.task = self.loop.create_task(self.poll_status())
 
     def stop(self):
         self.task.cancel()
@@ -575,12 +730,15 @@ class sofa_spotify_controller(object):
     async def poll_status(self):
         try:
             while self.active:
-                print('player: %s %s of %s' % (self.vlc.get_state(), (self.vlc.get_position() * (self.vlc.get_length() / 1000)), self.vlc.get_length() / 1000))
-                if self.vlc.get_state()=="State.Ended":
-                    if self.active:
-                        self.play()
-                    else:
-                        self.loop.call_soon(self.stop)
+                try:
+                    npdata=self.player.playback_currently_playing()
+                    #self.log.info('Progress: %s / %s' % ( npdata.progress_ms, npdata.item.duration_ms))
+                    #self.loop.call_soon(self.stop)
+                    if npdata.progress_ms==0 and not self.user_pause:
+                        await self.next_track()
+                except:
+                    self.log.error('.. error while polling - delaying 5 seconds', exc_info=True)
+                    await asyncio.sleep(5)
                 await asyncio.sleep(1)
         except:
             self.log.error('Error polling', exc_info=True)
