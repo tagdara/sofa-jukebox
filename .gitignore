@@ -4,4 +4,6 @@ gp
 .cache*
 user_playlist.json
 backup_playlist.json
+token.json
+data
 

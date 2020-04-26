@@ -1,0 +1,5 @@
+aiohttp
+aiohttp_cors
+aiohttp_sse
+aiofiles
+git+https://github.com/felix-hilden/spotipy.git
