@@ -2,4 +2,5 @@ aiohttp
 aiohttp_cors
 aiohttp_sse
 aiofiles
+tekore
 git+https://github.com/felix-hilden/spotipy.git

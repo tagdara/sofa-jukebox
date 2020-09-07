@@ -68,6 +68,8 @@ class web_server():
             self.cors.add(self.serverApp.router.add_get('/del/{id}', self.del_handler))
             self.cors.add(self.serverApp.router.add_get('/promote/{id}', self.promote_handler))
             self.cors.add(self.serverApp.router.add_get('/superpromote/{id}', self.super_promote_handler))
+            self.cors.add(self.serverApp.router.add_get('/display/{cmd:.+}', self.display_passthrough_handler))
+            self.cors.add(self.serverApp.router.add_post('/event', self.event_handler))
             self.runner = aiohttp.web.AppRunner(self.serverApp)
             self.loop.run_until_complete(self.runner.setup())
 
@@ -147,7 +149,28 @@ class web_server():
         except:
             self.log.error('.. Error handling Spotify redirect callback after manual authentication', exc_info=True)
         raise web.HTTPTemporaryRedirect('/')
+
+    # Librespot on-event handler for shim 
+    
+    async def event_handler(self, request):
         
+        try:
+            if request.body_exists:
+                try:
+                    body=await request.read()
+                    body=body.decode()
+                    self.log.info('.. librespot onevent: %s' % body)
+                    await self.app.spotify.check_status()
+                except:
+                    self.log.info('error onevent request', exc_info=True)
+                    
+            return web.json_response({"data":"thanks"})
+        
+        except:
+            self.log.info('error handling list post', exc_info=True)
+
+        return web.json_response({"data":"failed"})
+       
         
     # Backup playlist lists and management
     
@@ -323,6 +346,24 @@ class web_server():
         except:
             self.log.info('error promoting track', exc_info=True)
             return web.json_response([])
+
+    # webdisplay passthrough
+    
+    async def display_passthrough_handler(self, request):
+        try:
+            self.log.info('matchinfo: %s %s' % (request.match_info['cmd'], self.config))
+            if 'webdisplay_url' in self.config:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        self.log.info('Sending to %s' % (self.config['webdisplay_url']+"/"+request.match_info['cmd']) )
+                        await session.get(self.config['webdisplay_url']+"/"+request.match_info['cmd']) 
+                except:
+                    self.log.error('Error sending cmd to webdisplay', exc_info=True)
+            
+        except:
+            self.log.error('Error updating now playing subscribers', exc_info=True)
+            
+        return web.json_response([])
 
     # SSE Data delivery and subscription
     

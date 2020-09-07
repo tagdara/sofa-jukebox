@@ -22,20 +22,14 @@ import subprocess
 import logging
 from logging.handlers import RotatingFileHandler
 
-#from spotipy import Spotify, Credentials
-#from spotipy.scope import every
 import tekore
-from tekore import util, Spotify, Credentials
-from tekore.auth.refreshing import RefreshingToken
-from tekore.scope import scopes, every
-from tekore.sender import AsyncPersistentSender, RetryingSender
-from tekore.client.api import SpotifyPlayer
-from tekore.convert import to_uri
+from tekore import Spotify, Credentials, RefreshingToken, AsyncPersistentSender, RetryingSender
 from datetime import datetime
 import uuid
 
 import random
 import requests
+import subprocess
 
 class AuthorizationNeeded(Exception):
     pass
@@ -78,7 +72,7 @@ class sofa_spotify_controller(object):
     @property
     def auth_url(self):
         try:
-            return self.credentials.user_authorisation_url(scope=every)
+            return self.credentials.user_authorisation_url(scope=tekore.scope.every)
         except:
             self.log.error('.. error retrieving authorization url', exc_info=True)
         return "" 
@@ -164,19 +158,40 @@ class sofa_spotify_controller(object):
             if self.token:
                 #self.log.info('user: %s' % await self.spotify.current_user())
                 userobj=await self.spotify.current_user()
-                return userobj.asdict()
+                return userobj.asbuiltin()
         except tekore.client.decor.error.Unauthorised:
             self.log.error('.. Invalid access token: %s' % self.token.access_token)
         except:
             self.log.error('.. error getting user info', exc_info=True)
         return {}
     
-
+    async def restart_local_playback_device(self):
+        # This allows you to select a playback device by name
+        try:
+            stdoutdata = subprocess.getoutput("systemctl restart raspotify")
+            self.log.info('>> restart local playback device %s' % stdoutdata)
+            return True
+        except:
+            self.log.error('Error restarting local playback', exc_info=True)
+        return False
         
     async def set_playback_device(self, name, restart=True):
         # This allows you to select a playback device by name
         try:
             # try to restart the local spotifyd since it tends to fail over time     
+            devs=await self.spotify.playback_devices()
+            for dev in devs:
+                if dev.name==name:
+                    self.log.info('transferring to %s' % dev.id)
+                    await self.spotify.playback_transfer(dev.id)
+                    self.device=dev.id
+                    return True
+                    
+            self.log.info('did not find local playback device %s.  restarting' % name)
+            
+            await self.restart_local_playback_device()
+            await asyncio.sleep(2)
+            
             devs=await self.spotify.playback_devices()
             for dev in devs:
                 if dev.name==name:
@@ -220,7 +235,7 @@ class sofa_spotify_controller(object):
             outlist=[]
             devices=await self.spotify.playback_devices()
             for dev in devices:
-                newdev=dev.asdict()
+                newdev=dev.asbuiltin()
                 newdev['type']='unknown'
                 outlist.append(newdev)
             self.log.info('X: %s' % outlist )
@@ -256,8 +271,10 @@ class sofa_spotify_controller(object):
                     covers=await self.spotify.playlist_cover_image(playlist.id)
                     if len(covers)>0:
                         cover=covers[0].url
+                except concurrent.futures._base.CancelledError:
+                    self.log.error('Error getting cover for %s (cancelled)' % playlist.name, exc_info=True)
                 except:
-                    self.log.error('Error getting cover for %s' % playlist, exc_info=True)
+                    self.log.error('Error getting cover for %s' % playlist.name, exc_info=True)
                 display_list.append({"name":playlist.name, "id":playlist.id, "art": cover, "owner": playlist.owner.id})
             return display_list
         except:
@@ -399,7 +416,7 @@ class sofa_spotify_controller(object):
         try:
         
             nowplaying=await self.now_playing()
-            #self.log.info('Updating nowplaying data: %s' % nowplaying)
+            self.log.info('Updating nowplaying data: %s' % nowplaying)
             if 'webdisplay_url' in self.config:
                 try:
                     async with aiohttp.ClientSession() as session:
@@ -429,7 +446,7 @@ class sofa_spotify_controller(object):
                 return {}
             item=track.item
             return {"id": item.id, "name": item.name, "art":item.album.images[0].url, "artist": item.artists[0].name, 
-                    "album": item.album.name, "url":item.href, "is_playing": track.is_playing }
+                    "album": item.album.name, "url":item.href, "is_playing": track.is_playing, "length": int(track.item.duration_ms/1000), "position": int(track.progress_ms/1000) }
         except:
             self.log.error('.. error getting track data from %s' % track)
             return {}
@@ -441,6 +458,8 @@ class sofa_spotify_controller(object):
             if self.spotify:
                 try:
                     npdata=await self.spotify.playback_currently_playing()
+                    #self.log.info('raw: %s' % npdata)
+                    #self.log.info('raw: %s' % npdata.item)
                     nowplaying=await self.get_track_data(npdata)
                 except requests.exceptions.HTTPError:
                     self.log.warn('.. Token may have expired: %s' % self.token)
@@ -473,7 +492,11 @@ class sofa_spotify_controller(object):
             #if not self.device:
             #    await self.set_playback_device(self.config['default_device'])
             
-            await self.spotify.playback_resume()             
+            try:
+                await self.spotify.playback_resume()
+            except tekore.Forbidden:
+                await self.next_track()
+
             self.active=True
             await self.update_now_playing()
             await self.start_status()
@@ -610,22 +633,32 @@ class sofa_spotify_controller(object):
 
     def stop(self):
         self.task.cancel()
+        
+
+    async def check_status(self):
+        try:
+            track=await self.spotify.playback_currently_playing()
+            if not track:
+                self.log.info('.. no track currently active')
+                self.active=False
+            else:
+                track_data=await self.get_track_data(track)
+                if track_data and track.progress_ms==0 and not self.user_pause:
+                    self.log.info('.. track ended: %s - %s' % (track_data['artist'], track_data['name']))
+                    self.active=False
+                    await self.next_track()
+        except:        
+            self.log.error('!! error checking track', exc_info=True)
+
 
     async def poll_status(self):
         
         while self.running:
             try:
                 if self.active:
-                    track=await self.spotify.playback_currently_playing()
-                    if not track:
-                        self.log.info('.. no track currently active')
-                        self.active=False
-                    else:
-                        track_data=await self.get_track_data(track)
-                        if track_data and track.progress_ms==0 and not self.user_pause:
-                            self.log.info('.. track ended: %s - %s' % (track_data['artist'], track_data['name']))
-                            self.active=False
-                            await self.next_track()
+                    pass
+                    # TODO/CHEESE - this is only needed if we are not using the event tracker from librespot
+                    #await self.check_status()
                 await asyncio.sleep(1)
             except GeneratorExit:
                 #self.log.error('!! Generator Exit')

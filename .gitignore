@@ -1,9 +1,10 @@
 config.json
 log
+*.log
 gp
 .cache*
 user_playlist.json
 backup_playlist.json
 token.json
 data
-
+__pycache__
